@@ -1,0 +1,764 @@
+# ---------- #
+# assignment
+# ---------- #
+
+
+# compute indirect utility ------------------------------------------------
+
+compute_indirect_utility <-
+  function(
+    df, 
+    beta, 
+    sigma, 
+    mu, 
+    omega
+  ){
+    df_compute_u <- df %>%
+      dplyr::mutate(
+        beta_1 = beta[1] + sigma[1] * v_x_1,
+        beta_2 = beta[2] + sigma[2] * v_x_2,
+        beta_3 = beta[3] + sigma[3] * v_x_3,
+        alpha = -exp(mu + omega * v_p),
+        u = beta_1 * x_1 + beta_2 * x_2 + beta_3 * x_3  + alpha * p + xi
+      )
+    return(df_compute_u$u)
+  }
+
+
+# compute choice smooth ---------------------------------------------------
+
+compute_choice_smooth <-
+  function(
+    X,
+    M,
+    V,
+    beta,
+    sigma,
+    mu,
+    omega
+  ){
+    # constants
+    T <- max(M$t)
+    N <- max(V$i)
+    J <- max(X$j)
+    # make choice data
+    df <- 
+      expand.grid(
+        t = 1:T, 
+        i = 1:N, 
+        j = 0:J
+      ) %>%
+      tibble::as_tibble() %>%
+      dplyr::left_join(
+        V, 
+        by = c("i", "t")
+      ) %>%
+      dplyr::left_join(
+        X, 
+        by = c("j")
+      ) %>%
+      dplyr::left_join(
+        M, 
+        by = c("j", "t")
+      ) %>%
+      dplyr::filter(!is.na(p)) %>%
+      dplyr::arrange(
+        t, 
+        i, 
+        j
+      )
+    # compute indirect utility
+    u <- 
+      compute_indirect_utility(
+        df, 
+        beta, 
+        sigma, 
+        mu, 
+        omega
+      )
+    # add u
+    df_choice <-
+      data.frame(
+        df,
+        u
+      ) %>%
+      tibble::as_tibble()
+    # make choice
+    df_choice <-
+      df_choice %>%
+      dplyr::group_by(
+        t,
+        i
+      ) %>%
+      dplyr::mutate(q = exp(u) / sum(exp(u))) %>%
+      dplyr::ungroup()
+    # return
+    return(df_choice)
+  }
+
+
+# compute share smooth ----------------------------------------------------
+
+compute_share_smooth <-
+  function(
+    X,
+    M,
+    V,
+    beta,
+    sigma,
+    mu,
+    omega
+  ){
+    # constants
+    T <- max(M$t)
+    N <- max(V$i)
+    J <- max(X$j)
+    # compute choice
+    df_choice <- 
+      compute_choice_smooth(
+        X, 
+        M, 
+        V, 
+        beta, 
+        sigma, 
+        mu, 
+        omega
+      )
+    # make share data
+    df_share_smooth <-
+      df_choice %>%
+      dplyr::select(
+        -dplyr::starts_with("v_"),
+        -u,
+        -i
+      ) %>%
+      dplyr::group_by(
+        t,
+        j
+      ) %>%
+      dplyr::mutate(q = sum(q)) %>%
+      dplyr::ungroup() %>%
+      dplyr::distinct(
+        t,
+        j,
+        .keep_all = TRUE
+      ) %>%
+      dplyr::group_by(t) %>%
+      dplyr::mutate(s = q/sum(q)) %>%
+      dplyr::ungroup()
+    # log share difference
+    df_share_smooth <-
+      df_share_smooth %>%
+      dplyr::group_by(t) %>%
+      dplyr::mutate(y = log(s/sum(s * (j == 0)))) %>%
+      dplyr::ungroup()
+    return(df_share_smooth)
+    }
+
+
+# compute the derivative of share smooth ----------------------------------
+
+compute_derivative_share_smooth <-
+  function(
+    X,
+    M,
+    V,
+    beta,
+    sigma,
+    mu,
+    omega){
+    # constants
+    T <- max(M$t)
+    # data
+    df_share_smooth <- 
+      compute_share_smooth(
+        X, 
+        M, 
+        V, 
+        beta, 
+        sigma, 
+        mu, 
+        omega
+      )
+    df_choice_smooth <-
+      compute_choice_smooth(
+        X, 
+        M, 
+        V, 
+        beta, 
+        sigma, 
+        mu, 
+        omega
+      )
+    # number of products in each market
+    num_j <-
+      df_share_smooth %>%
+      dplyr::filter(j != 0) %>%
+      dplyr::group_by(t) %>%
+      dplyr::mutate(
+        num_j = length(unique(j))
+      ) %>%
+      dplyr::select(
+        t,
+        num_j
+      ) %>%
+      dplyr::distinct() 
+    # get the derivative
+    derivative_share_smooth <-
+      foreach(
+        TT = 1:T
+      ) %dopar% {
+        df_choice_smooth_t <- 
+          df_choice_smooth %>%
+          dplyr::filter(t %in% TT & j != 0) %>%
+          dplyr::mutate(
+            alpha = -exp(mu + omega * v_p)
+          ) %>%
+          dplyr::select(t, i, j, q, alpha)
+        
+        num_j_t <- num_j$num_j[TT]
+        
+        j_count <- 
+          df_choice_smooth_t %>%
+          dplyr::select(t, j) %>%
+          unique() %>%
+          cbind(
+            j_count = 1:num_j_t
+          ) %>%
+          dplyr::select(-t)
+
+        df_choice_smooth_t <- 
+          df_choice_smooth_t %>%
+          dplyr::left_join(
+            j_count,
+            by = "j"
+          )
+        
+        df_jk <- 
+          foreach(
+            s = 1 : num_j_t,
+            .combine = "cbind"
+          ) %dopar%{
+            df_jk <- 
+              df_choice_smooth_t %>%
+              dplyr::group_by(i) %>%
+              dplyr::mutate(
+                q_j = q[j_count == s]
+              ) %>%
+              dplyr::ungroup() %>%
+              dplyr::select(q_j)
+          }
+        colnames(df_jk) <- paste("q", 1:num_j_t, sep = "_")
+        df_jk <- 
+          df_choice_smooth_t %>%
+          cbind(
+            df_jk
+          ) %>%
+          dplyr::select(
+            -t,
+            -i,
+            -j,
+            -j_count,
+            -q
+          ) %>%
+          dplyr::distinct()
+        alpha <- df_jk$alpha
+        df_jk <-
+          df_jk %>%
+          dplyr::select(-alpha)
+        
+        derivative_share_smooth <- matrix(NA, nrow = num_j_t, ncol = num_j_t)
+        
+        for (j in 1 : num_j_t) {
+          for (k in 1 : num_j_t) {
+            derivative_share_smooth[j, k] <- 
+              ifelse(
+                j == k,
+                mean(alpha * df_jk[ , j] * (1 - df_jk[ , j]) ),
+                - mean(alpha * df_jk[ , j] *  df_jk[ , k])
+              )  
+          }
+        }
+        return(derivative_share_smooth)
+      }
+  }
+
+# update the price --------------------------------------------------------
+
+update_price <-
+  function(
+    logp, 
+    X, 
+    M, 
+    V, 
+    beta, 
+    sigma, 
+    mu, 
+    omega, 
+    delta){
+    # constants
+    T <- max(M$t)
+    N <- max(V$i)
+    J <- max(X$j)
+    # update data
+    df_share <- 
+      compute_share_smooth(
+        X, 
+        M, 
+        V, 
+        beta, 
+        sigma, 
+        mu, 
+        omega
+      ) %>%
+      dplyr::filter(j != 0) %>%
+      dplyr::mutate(
+        p = exp(logp)
+      ) %>%
+      dplyr::select(
+        -q,
+        -s,
+        -y
+      )
+    p_new <- 
+      df_share %>%
+      dplyr::select(
+        t, j, p
+      )
+    # number of products in each market
+    num_j <-
+      df_share %>%
+      dplyr::group_by(t) %>%
+      dplyr::mutate(
+        num_j = length(unique(j))
+      ) %>%
+      dplyr::select(
+        t,
+        num_j
+      ) %>%
+      dplyr::distinct() 
+
+    df_choice_update <-
+      compute_choice_smooth(
+        X, 
+        M, 
+        V, 
+        beta, 
+        sigma, 
+        mu, 
+        omega
+      ) %>%
+      dplyr::filter(j != 0) %>%
+      dplyr::select(
+        -p,
+        -u,
+        -q) %>%
+      dplyr::left_join(
+        p_new,
+        by = c("t", "j")
+      ) %>%
+      mutate(
+        beta_1 = beta[1] + sigma[1] * v_x_1,
+        beta_2 = beta[2] + sigma[2] * v_x_2,
+        beta_3 = beta[3] + sigma[3] * v_x_3,
+        alpha = -exp(mu + omega * v_p),
+        u = beta_1 * x_1 + beta_2 * x_2 + beta_3 * x_3  + alpha * p + xi
+      ) %>%
+      dplyr::select(
+        t, i, j, p, u, alpha
+      )
+    # add outside option
+    outside <- 
+      expand.grid(
+        j = 0, 
+        t = 1:T, 
+        i = 1:N,
+        p = 0,
+        u = 0,
+        alpha = 0
+      ) %>%
+      as_tibble()
+    
+    df_choice_update <- 
+      rbind(
+        df_choice_update,
+        outside
+      ) %>%
+      dplyr::arrange(
+        t, 
+        i
+      ) %>%      
+      dplyr::group_by(
+        t,
+        i
+      ) %>%
+      dplyr::mutate(
+        q = exp(u) / sum(exp(u))
+                    ) %>%
+      dplyr::ungroup() %>%
+      dplyr::group_by(
+        t,
+        j
+      ) %>%
+      mutate(
+        s = mean(q)
+      ) %>%
+      dplyr::ungroup()
+    
+    c <- df_share %>%
+      dplyr::select(
+        t, j, c
+      )
+    cs <- 
+      df_choice_update %>%
+      dplyr::select(
+        t, j, s
+      ) %>%
+      dplyr::filter(
+        j != 0
+      ) %>%
+      unique() %>%
+      dplyr::left_join(
+        c,
+        by = c("t", "j")
+      )
+
+    # get the derivative
+    derivative_share_smooth <-
+      foreach(
+        TT = 1:T
+      ) %dopar% {
+        df_choice_smooth_t <- 
+          df_choice_update %>%
+          dplyr::filter(t %in% TT & j != 0) %>%
+          dplyr::select(t, i, j, q, alpha)
+        
+        num_j_t <- num_j$num_j[TT]
+        
+        j_count <- 
+          df_choice_smooth_t %>%
+          dplyr::select(t, j) %>%
+          unique() %>%
+          cbind(
+            j_count = 1:num_j_t
+          ) %>%
+          dplyr::select(-t)
+        
+        df_choice_smooth_t <- 
+          df_choice_smooth_t %>%
+          dplyr::left_join(
+            j_count,
+            by = "j"
+          )
+        
+        df_jk <- 
+          foreach(
+            ss = 1 : num_j_t,
+            .combine = "cbind"
+          ) %dopar%{
+            df_jk <- 
+              df_choice_smooth_t %>%
+              dplyr::group_by(i) %>%
+              dplyr::mutate(
+                q_j = q[j_count == ss]
+              ) %>%
+              dplyr::ungroup() %>%
+              dplyr::select(q_j)
+          }
+        colnames(df_jk) <- paste("q", 1:num_j_t, sep = "_")
+        df_jk <- 
+          df_choice_smooth_t %>%
+          cbind(
+            df_jk
+          ) %>%
+          dplyr::select(
+            -t,
+            -i,
+            -j,
+            -j_count,
+            -q
+          ) %>%
+          dplyr::distinct()
+        alpha <- df_jk$alpha
+        df_jk <-
+          df_jk %>%
+          dplyr::select(-alpha)
+        
+        derivative_share_smooth <- matrix(NA, nrow = num_j_t, ncol = num_j_t)
+        
+        for (j in 1 : num_j_t) {
+          for (k in 1 : num_j_t) {
+            derivative_share_smooth[j, k] <- 
+              ifelse(
+                j == k,
+                mean(alpha * df_jk[ , j] * (1 - df_jk[ , j]) ),
+                - mean(alpha * df_jk[ , j] *  df_jk[ , k])
+              )  
+          }
+        }
+        return(derivative_share_smooth)
+      }
+p_new <-    
+  foreach(
+    TT = 1:T,
+    .combine = "rbind"
+    ) %dopar% {
+    cs_t <- 
+      cs %>%
+      dplyr::filter(t %in% TT)
+    
+    Omega <- -derivative_share_smooth[[TT]] * delta[[TT]]
+    p_new <-
+      cs_t$c + solve(Omega) %*% cs_t$s
+    }
+return(p_new)
+  }
+
+
+# estimate the marginal cost ----------------------------------------------
+
+estimate_marginal_cost <-
+  function(
+    logp, 
+    X, 
+    M, 
+    V, 
+    beta, 
+    sigma, 
+    mu, 
+    omega, 
+    delta){
+    p_new <- 
+      update_price(
+        logp, 
+        X, 
+        M, 
+        V, 
+        beta, 
+        sigma, 
+        mu, 
+        omega, 
+        delta
+      )
+    c <- 
+      compute_share_smooth(
+        X, 
+        M, 
+        V, 
+        beta, 
+        sigma, 
+        mu, 
+        omega
+      ) %>%
+      dplyr::filter(j != 0) %>%
+      dplyr::select(c)
+    
+    marginal_cost <- exp(logp) - (p_new - c)
+    return(marginal_cost)  
+  }
+
+
+# compute producer surplus ------------------------------------------------
+
+compute_producer_surplus <-
+  function(
+    p_actual, 
+    marginal_cost, 
+    X, 
+    M, 
+    V, 
+    beta, 
+    sigma, 
+    mu, 
+    omega){
+    # constants
+    T <- max(M$t)
+    N <- max(V$i)
+    J <- max(X$j)
+    
+    mc <- marginal_cost$estimate
+    p_new <- 
+      compute_share_smooth(
+        X, 
+        M, 
+        V, 
+        beta, 
+        sigma, 
+        mu, 
+        omega
+      ) %>%
+      dplyr::filter(j != 0) %>%
+      dplyr::mutate(
+        p = p_actual
+      ) %>%
+      dplyr::select(
+        t, j, p
+      )
+    # update data
+    df_choice_update <-
+      compute_choice_smooth(
+        X, 
+        M, 
+        V, 
+        beta, 
+        sigma, 
+        mu, 
+        omega
+      ) %>%
+      dplyr::filter(j != 0) %>%
+      dplyr::select(
+        -p,
+        -u,
+        -q) %>%
+      dplyr::left_join(
+        p_new,
+        by = c("t", "j")
+      ) %>%
+      mutate(
+        beta_1 = beta[1] + sigma[1] * v_x_1,
+        beta_2 = beta[2] + sigma[2] * v_x_2,
+        beta_3 = beta[3] + sigma[3] * v_x_3,
+        alpha = -exp(mu + omega * v_p),
+        u = beta_1 * x_1 + beta_2 * x_2 + beta_3 * x_3  + alpha * p + xi
+      ) %>%
+      dplyr::select(
+        t, i, j, p, u
+      )
+    
+    # add outside option
+    outside <- 
+      expand.grid(
+        j = 0, 
+        t = 1:T, 
+        i = 1:N,
+        p = 0,
+        u = 0
+      ) %>%
+      as_tibble()
+    
+    df_p_surplus <- 
+      rbind(
+        df_choice_update,
+        outside
+      ) %>%
+      dplyr::arrange(
+        t, 
+        i
+      ) %>%      
+      dplyr::group_by(
+        t,
+        i
+      ) %>%
+      dplyr::mutate(
+        q = exp(u) / sum(exp(u))
+      ) %>%
+      dplyr::ungroup() %>%
+      dplyr::group_by(
+        t,
+        j
+      ) %>%
+      mutate(
+        s = mean(q)
+      ) %>%
+      dplyr::ungroup() %>%
+      dplyr::filter(j != 0) %>%
+      dplyr::select(t, j, s) %>%
+      unique() %>%
+      cbind(
+        p_actual,
+        mc
+      ) %>%
+      dplyr::mutate(
+        p_surplus = (p_actual - mc) * s
+      )
+    return(df_p_surplus$p_surplus) 
+  }
+
+
+# compute consumer surplus ------------------------------------------------
+
+compute_consumer_surplus <-
+  function(
+    p_actual, 
+    X, 
+    M, 
+    V, 
+    beta, 
+    sigma, 
+    mu, 
+    omega){
+    # constants
+    T <- max(M$t)
+    N <- max(V$i)
+    J <- max(X$j)
+    p_new <- 
+      compute_share_smooth(
+        X, 
+        M, 
+        V, 
+        beta, 
+        sigma, 
+        mu, 
+        omega
+      ) %>%
+      dplyr::filter(j != 0) %>%
+      dplyr::mutate(
+        p = p_actual
+      ) %>%
+      dplyr::select(
+        t, j, p
+      )
+    # update data
+    df_choice_update <-
+      compute_choice_smooth(
+        X, 
+        M, 
+        V, 
+        beta, 
+        sigma, 
+        mu, 
+        omega
+      ) %>%
+      dplyr::filter(j != 0) %>%
+      dplyr::select(
+        -p,
+        -u,
+        -q) %>%
+      dplyr::left_join(
+        p_new,
+        by = c("t", "j")
+      ) %>%
+      mutate(
+        beta_1 = beta[1] + sigma[1] * v_x_1,
+        beta_2 = beta[2] + sigma[2] * v_x_2,
+        beta_3 = beta[3] + sigma[3] * v_x_3,
+        alpha = -exp(mu + omega * v_p),
+        u = beta_1 * x_1 + beta_2 * x_2 + beta_3 * x_3  + alpha * p + xi
+      ) %>%
+      dplyr::select(
+        t, i, j, p, u, alpha
+      ) %>%
+      dplyr::group_by(
+        i,
+        t
+      ) %>%
+      dplyr::mutate(
+        cv = - log( sum(1 + exp(u)) ) / alpha
+      ) %>%
+      dplyr::ungroup() %>%
+      dplyr::select(t, i, cv) %>%
+      unique()
+    return(df_choice_update$cv)
+  }
+
+
+
+
+
+
+
+
+
+
+
+
