@@ -1,0 +1,544 @@
+---
+title: "Assignment"
+---
+```{r setup, include = FALSE}
+rm(list = ls())
+library(Assignment)
+library(dplyr)
+library(tibble)
+library(purrr)
+library(evd)
+library(doParallel)
+registerDoParallel()
+library(foreach)
+library(ggplot2)
+library(latex2exp)
+library(Matrix)
+dir.create("data", showWarnings = FALSE)
+```
+
+```{r}
+# set the seed
+set.seed(1)
+# number of products
+J <- 10
+# dimension of product characteristics including the intercept
+K <- 3
+# number of markets
+T <- 100
+# number of consumers per market
+N <- 500
+# number of Monte Carlo
+L <- 500
+```
+
+```{r}
+# set parameters of interests
+beta <- rnorm(K) 
+beta[1] <- 4
+beta
+```
+
+```{r}
+sigma <- abs(rnorm(K))
+sigma
+```
+
+```{r}
+mu <- 0.5
+omega <- 1
+# set auxiliary parameters
+price_xi <- 1
+sd_x <- 2
+sd_xi <- 0.5
+sd_c <- 0.05
+sd_p <- 0.05
+```
+
+## 1. simulate data
+```{r}
+# make product characteristics data
+X <- 
+  matrix(
+       sd_x * rnorm(J * (K - 1)), 
+       nrow = J
+       )
+X <- 
+  cbind(
+       rep(1, J),
+       X
+       )
+colnames(X) <- paste("x", 1:K, sep = "_")
+X <- 
+  data.frame(j = 1:J, X) %>%
+  tibble::as_tibble()
+# add outside option
+X <- 
+  rbind(
+  rep(0, dim(X)[2]),
+  X
+  ) 
+X
+```
+
+```{r}
+# make market-product data
+M <- 
+  expand.grid(
+    j = 1:J, 
+    t = 1:T
+    ) %>%
+  tibble::as_tibble() %>%
+  dplyr::mutate(
+    xi = sd_xi * rnorm(J*T),
+    c = exp(sd_c * rnorm(J*T)),
+    p = 0
+  ) 
+M <- 
+  M %>%
+  dplyr::group_by(t) %>%
+  dplyr::sample_frac(size = purrr::rdunif(1, J)/J) %>%
+  dplyr::ungroup()
+# add outside option
+outside <- 
+  data.frame(
+    j = 0, 
+    t = 1:T, 
+    xi = 0, 
+    c = 0, 
+    p = 0
+    )
+M <- 
+  rbind(
+    M,
+    outside
+    ) %>%
+  dplyr::arrange(
+    t, 
+    j
+    )
+M
+```
+```{r}
+# make consumer-market data
+V <- 
+  matrix(
+    rnorm(N * T * (K + 1)), 
+    nrow = N * T
+    ) 
+colnames(V) <- 
+  c(
+    paste("v_x", 1:K, sep = "_"), 
+    "v_p"
+    )
+V <- 
+  data.frame(
+  expand.grid(
+    i = 1:N, 
+    t = 1:T
+    ),
+  V
+  ) %>%
+  tibble::as_tibble()
+V
+```
+
+```{r}
+# make choice data
+df <- 
+  expand.grid(
+    t = 1:T, 
+    i = 1:N, 
+    j = 0:J
+    ) %>%
+    tibble::as_tibble() %>%
+    dplyr::left_join(
+      V, 
+      by = c("i", "t")
+      ) %>%
+    dplyr::left_join(
+      X, 
+      by = c("j")
+      ) %>%
+    dplyr::left_join(
+      M, 
+      by = c("j", "t")
+      ) %>%
+    dplyr::filter(!is.na(p)) %>%
+    dplyr::arrange(
+      t, 
+      i, 
+      j
+      )
+df
+```
+
+```{r}
+# compute indirect utility
+u <- 
+  compute_indirect_utility(
+    df, 
+    beta, 
+    sigma, 
+    mu, 
+    omega
+    )
+head(u)
+```
+
+```{r}
+df_choice_smooth <-
+  compute_choice_smooth(
+    X, 
+    M, 
+    V, 
+    beta, 
+    sigma, 
+    mu, 
+    omega
+    )
+df_choice_smooth
+summary(df_choice_smooth)
+```
+
+```{r}
+df_share_smooth <- 
+  compute_share_smooth(
+    X, 
+    M, 
+    V, 
+    beta, 
+    sigma, 
+    mu, 
+    omega
+    )
+df_share_smooth
+summary(df_share_smooth)
+```
+
+```{r}
+derivative_share_smooth <-
+  compute_derivative_share_smooth(
+    X = X,
+    M = M, 
+    V = V, 
+    beta = beta, 
+    sigma = sigma, 
+    mu = mu, 
+    omega = omega
+    )
+derivative_share_smooth[[1]]
+derivative_share_smooth[[T]]
+```
+
+```{r}
+# number of products in each market
+num_j <-
+  df_share_smooth %>%
+  dplyr::filter(j != 0) %>%
+  dplyr::group_by(t) %>%
+  dplyr::mutate(
+    num_j = length(unique(j))
+    ) %>%
+  dplyr::select(
+    t,
+    num_j
+    ) %>%
+  dplyr::distinct() 
+delta <-
+  foreach(
+      t = 1 : T
+    ) %dopar%{
+      Delta <- diag(num_j$num_j[t])
+    }
+delta[[1]]
+delta[[T]]
+```
+
+
+```{r}
+# set the threshold
+lambda <- 1e-6
+# set the initial price
+p <- M[M$j > 0, "p"]
+logp <- log(rep(1, dim(p)[1]))
+p_new <- 
+  update_price(
+    logp = logp, 
+    X = X, 
+    M = M, 
+    V = V, 
+    beta = beta, 
+    sigma = sigma, 
+    mu = mu, 
+    omega = omega, 
+    delta = delta
+    )
+# iterate
+distance <- 10000
+while (distance > lambda) {
+  p_old <- p_new
+  p_new <- 
+    update_price(
+      log(p_old), 
+      X, 
+      M, 
+      V, 
+      beta, 
+      sigma, 
+      mu, 
+      omega, 
+      delta
+      )
+  distance <- max(abs(p_new - p_old))
+  print(distance)
+}
+# save
+p_actual <- p_new
+saveRDS(
+  p_actual, 
+  file = "data/A5_price_actual.rds"
+  )
+```
+
+```{r}
+# load
+p_actual <- 
+  readRDS(file = "data/A5_price_actual.rds")
+p_actual %>% head()
+```
+## 2. estimate the parameters
+
+```{r}
+# take the logarithm
+logp <- log(p_actual)
+# estimate the marginal cost
+marginal_cost_estimate <- 
+  estimate_marginal_cost(
+    logp = logp, 
+    X = X, 
+    M = M, 
+    V = V, 
+    beta = beta, 
+    sigma = sigma, 
+    mu = mu, 
+    omega = omega, 
+    delta = delta)
+colnames(marginal_cost_estimate) <- "estimate"
+
+marginal_cost_actual <- M[M$j > 0, ]$c
+# plot the estimate vs actual marginal costs
+marginal_cost_df <-
+  data.frame(
+    actual = marginal_cost_actual,
+    estimate = marginal_cost_estimate
+    )
+ggplot(
+  marginal_cost_df, 
+  aes(
+    x = estimate, 
+    y = actual
+    )
+  ) +
+  geom_point() + 
+  theme_classic()
+```
+
+## 3. conduct cunterfactual simulation
+```{r}
+delta_counterfactual <-
+  foreach(
+      TT = 1 : T
+    ) %dopar%{
+      num_j_t <- num_j$num_j[TT]
+      df_count_delta_t <-
+        df_share_smooth %>%
+        dplyr::filter(t %in% TT & j != 0) %>%
+        dplyr::select(t, j) %>%
+        dplyr::mutate(
+          own_123 = ifelse(
+            j == 1|j == 2|j == 3,
+            "T",
+            "F"
+            )
+          ) %>% 
+        dplyr::filter(
+          own_123 == "T")
+d_1 <- dim(df_count_delta_t)[1]
+d_2 <- num_j_t - d_1
+delta_counterfactual <- 
+  Matrix::bdiag(matrix(1, d_1, d_1), 
+                diag(1, d_2, d_2))
+    }
+delta_counterfactual[[1]]
+delta_counterfactual[[T]]
+```
+
+```{r}
+logp <- log(p_actual)
+p_new <- 
+  update_price(
+    logp = logp, 
+    X = X, 
+    M = M, 
+    V = V, 
+    beta = beta, 
+    sigma = sigma, 
+    mu = mu, 
+    omega = omega, 
+    delta = delta_counterfactual
+    )
+distance <- 10000
+while (distance > lambda) {
+  p_old <- p_new
+  p_new <- 
+    update_price(
+      log(p_old), 
+      X, 
+      M, 
+      V, 
+      beta, 
+      sigma, 
+      mu, 
+      omega, 
+      delta_counterfactual
+      )
+  distance <- max(abs(p_new - p_old))
+  print(distance)
+}
+p_counterfactual <- p_new
+saveRDS(
+  p_counterfactual, 
+  file = "data/A5_price_counterfactual.rds"
+  )
+```
+
+```{r}
+p_counterfactual <- 
+  readRDS(file = "data/A5_price_counterfactual.rds")
+p_counterfactual %>% head() 
+```
+
+```{r}
+df_p_change <-
+  df_share_smooth %>%
+  dplyr::filter(j != 0) %>%
+  dplyr::select(t, j) %>% 
+  cbind(
+    p_actual,
+    p_counterfactual
+    ) %>%
+  dplyr::arrange(
+    j
+    ) %>%
+  dplyr::group_by(j) %>%
+  dplyr::mutate(
+    p_change = mean((p_counterfactual - p_actual)/p_actual)
+  ) %>%
+  dplyr::select(j, p_change) %>%
+  unique()
+df_p_change
+```
+
+
+```{r}
+# compute actual producer surplus
+producer_surplus_actual <-
+  compute_producer_surplus(
+    p_actual = p_actual, 
+    marginal_cost = marginal_cost_estimate, 
+    X = X, 
+    M = M, 
+    V = V, 
+    beta = beta, 
+    sigma = sigma, 
+    mu = mu, 
+    omega = omega
+    )
+summary(producer_surplus_actual)
+```
+
+
+```{r}
+# compute counterfactual producer surplus
+producer_surplus_counterfactual <-
+  compute_producer_surplus(
+    p_actual = p_counterfactual, 
+    marginal_cost = marginal_cost_estimate, 
+    X = X, 
+    M = M, 
+    V = V, 
+    beta = beta, 
+    sigma = sigma, 
+    mu = mu, 
+    omega = omega
+    )
+summary(producer_surplus_counterfactual)
+```
+
+
+```{r}
+df_producer_surplus_change <-
+  df_share_smooth %>%
+  dplyr::filter(j != 0) %>%
+  dplyr::select(t, j) %>% 
+  cbind(
+    producer_surplus_actual,
+    producer_surplus_counterfactual
+    ) %>%
+  dplyr::arrange(
+    j
+    ) %>%
+  dplyr::group_by(j) %>%
+  dplyr::mutate(
+    producer_surplus_change = mean((producer_surplus_counterfactual - producer_surplus_actual) / producer_surplus_actual)
+  ) %>%
+  dplyr::select(j, producer_surplus_change) %>%
+  unique()
+df_producer_surplus_change
+```
+
+
+```{r}
+# compute actual consumer surplus
+consumer_surplus_actual <- 
+  compute_consumer_surplus(
+    p_actual = p_actual, 
+    X = X, 
+    M = M, 
+    V = V, 
+    beta = beta, 
+    sigma = sigma, 
+    mu = mu, 
+    omega = omega
+    )
+summary(consumer_surplus_actual)
+```
+
+```{r}
+# compute counterfactual consumer surplus
+consumer_surplus_counterfactual <- 
+  compute_consumer_surplus(
+    p_actual = p_counterfactual, 
+    X = X, 
+    M = M, 
+    V = V, 
+    beta = beta, 
+    sigma = sigma, 
+    mu = mu, 
+    omega = omega
+    )
+summary(consumer_surplus_counterfactual)
+```
+
+```{r}
+consumer_surplus_change <- 
+  (sum(consumer_surplus_counterfactual) - 
+     sum(consumer_surplus_actual)) /
+  sum(consumer_surplus_actual)
+consumer_surplus_change
+```
+
+
+
+
